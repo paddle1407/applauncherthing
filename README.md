@@ -1,7 +1,7 @@
 # App Launcher Thing
 - aka ALT
-
-# USE AT YOUR OWN RISK, I AM NOT RESPONSIBLE FOR ANY DAMAGES.
+- 
+__use at your own risk, I am not responsible for any damages.__
 
 This was originaly a program written by me to do math and have a timer in the terminal Now its a full on App Launcher
 
