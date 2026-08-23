@@ -7,6 +7,11 @@ This was originaly a program written by me to do math and have a timer in the te
 
 Will create files in .local/share/mylauncher
 
-__Dependencies__
+__dependencies__
 
 - crossterm version 0.29.0
+- unicode-width version 0.2.0
+
+__build instructions__
+
+cargo build --release
