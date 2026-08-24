@@ -70,6 +70,12 @@ const RAW: Palette = Palette {
     danger: Color::Red,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Apps,
+    Actions { action_selected: usize },
+}
+
 struct State {
     query: String,
     cursor: usize,
@@ -81,6 +87,7 @@ struct State {
     settings: Settings,
     recents: Vec<String>,
     launch_error: Option<String>,
+    view_mode: ViewMode,
 }
 
 fn main() -> io::Result<()> {
@@ -104,6 +111,7 @@ fn main() -> io::Result<()> {
         settings,
         recents,
         launch_error: None,
+        view_mode: ViewMode::Apps,
     };
 
     run(&mut state)
@@ -143,34 +151,56 @@ impl Drop for TerminalGuard {
 }
 
 fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
-    draw(state, stdout)?;
+    let mut needs_redraw = true;
+    let mut last_size = terminal::size().unwrap_or((0, 0));
+    let mut last_timer_check = std::time::Instant::now();
 
     loop {
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                    match key_event.code {
-                        KeyCode::Esc => break,
+        let current_size = terminal::size().unwrap_or(last_size);
+        if current_size != last_size {
+            last_size = current_size;
+            needs_redraw = true;
+        }
 
-                        KeyCode::Char('c')
-                            if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+        if needs_redraw {
+            draw(state, stdout)?;
+            needs_redraw = false;
+        }
+
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Resize(w, h) => {
+                    last_size = (w, h);
+                    needs_redraw = true;
+                }
+
+                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                    needs_redraw = true;
+                    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+
+                    match key_event.code {
+                        KeyCode::Esc => {
+                            if state.view_mode != ViewMode::Apps {
+                                state.view_mode = ViewMode::Apps;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        KeyCode::Char('c') if ctrl => {
                             break;
                         }
 
-                        KeyCode::Char('u')
-                            if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('u') if ctrl => {
                             state.query.clear();
                             state.cursor = 0;
                             state.selected = 0;
                             state.history_selected = 0;
                             state.launch_error = None;
+                            state.view_mode = ViewMode::Apps;
                         }
 
-                        KeyCode::Char('w')
-                            if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('w') if ctrl => {
                             while state.cursor > 0 {
                                 let prev = cursor_left(&state.query, state.cursor);
                                 let was_space = state.query[prev..state.cursor]
@@ -187,14 +217,94 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                             state.selected = 0;
                             state.history_selected = 0;
                             state.launch_error = None;
+                            state.view_mode = ViewMode::Apps;
                         }
 
                         KeyCode::Left => {
-                            state.cursor = cursor_left(&state.query, state.cursor);
+                            if state.view_mode != ViewMode::Apps {
+                                state.view_mode = ViewMode::Apps;
+                            } else {
+                                state.cursor = cursor_left(&state.query, state.cursor);
+                            }
                         }
 
                         KeyCode::Right => {
-                            state.cursor = cursor_right(&state.query, state.cursor);
+                            if state.view_mode == ViewMode::Apps
+                                && !is_timer_mode(&state.query)
+                                && !is_math_mode(&state.query)
+                                && !is_settings_mode(&state.query)
+                            {
+                                let matches = matching_apps(state);
+                                if let Some(app) = matches.get(state.selected) {
+                                    if !app.actions.is_empty() {
+                                        state.view_mode = ViewMode::Actions {
+                                            action_selected: 0,
+                                        };
+                                    } else {
+                                        state.cursor = cursor_right(&state.query, state.cursor);
+                                    }
+                                }
+                            } else {
+                                state.cursor = cursor_right(&state.query, state.cursor);
+                            }
+                        }
+
+                        KeyCode::Tab => {
+                            if state.view_mode == ViewMode::Apps
+                                && !is_timer_mode(&state.query)
+                                && !is_math_mode(&state.query)
+                                && !is_settings_mode(&state.query)
+                            {
+                                let matches = matching_apps(state);
+                                if let Some(app) = matches.get(state.selected) {
+                                    if !app.actions.is_empty() {
+                                        state.view_mode = ViewMode::Actions {
+                                            action_selected: 0,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+
+                        KeyCode::BackTab => {
+                            if state.view_mode != ViewMode::Apps {
+                                state.view_mode = ViewMode::Apps;
+                            }
+                        }
+
+                        KeyCode::Char('l') if ctrl => {
+                            if state.view_mode == ViewMode::Apps {
+                                let matches = matching_apps(state);
+                                if let Some(app) = matches.get(state.selected) {
+                                    if !app.actions.is_empty() {
+                                        state.view_mode = ViewMode::Actions {
+                                            action_selected: 0,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+
+                        KeyCode::Char('h') if ctrl || state.view_mode != ViewMode::Apps => {
+                            if state.view_mode != ViewMode::Apps {
+                                state.view_mode = ViewMode::Apps;
+                            }
+                        }
+
+                        KeyCode::Char('k') if ctrl || state.view_mode != ViewMode::Apps => {
+                            move_selection(state, -1);
+                        }
+
+                        KeyCode::Char('p') if ctrl => {
+                            move_selection(state, -1);
+                        }
+
+                        KeyCode::Char('j') if ctrl || state.view_mode != ViewMode::Apps => {
+                            move_selection(state, 1);
+                        }
+
+                        KeyCode::Char('n') if ctrl => {
+                            move_selection(state, 1);
                         }
 
                         KeyCode::Home => {
@@ -206,6 +316,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                         }
 
                         KeyCode::Char(c) => {
+                            state.view_mode = ViewMode::Apps;
                             state.query.insert(state.cursor, c);
                             state.cursor += c.len_utf8();
                             state.selected = 0;
@@ -214,23 +325,27 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                         }
 
                         KeyCode::Backspace => {
-                            if state.cursor > 0 {
+                            if state.view_mode != ViewMode::Apps {
+                                state.view_mode = ViewMode::Apps;
+                            } else if state.cursor > 0 {
                                 let prev = cursor_left(&state.query, state.cursor);
                                 state.query.remove(prev);
                                 state.cursor = prev;
+                                state.selected = 0;
+                                state.history_selected = 0;
+                                state.launch_error = None;
                             }
-                            state.selected = 0;
-                            state.history_selected = 0;
-                            state.launch_error = None;
                         }
 
                         KeyCode::Delete => {
-                            if state.cursor < state.query.len() {
+                            if state.view_mode != ViewMode::Apps {
+                                state.view_mode = ViewMode::Apps;
+                            } else if state.cursor < state.query.len() {
                                 state.query.remove(state.cursor);
+                                state.selected = 0;
+                                state.history_selected = 0;
+                                state.launch_error = None;
                             }
-                            state.selected = 0;
-                            state.history_selected = 0;
-                            state.launch_error = None;
                         }
 
                         KeyCode::Up => {
@@ -239,6 +354,14 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
 
                         KeyCode::Down => {
                             move_selection(state, 1);
+                        }
+
+                        KeyCode::PageUp => {
+                            move_selection(state, -5);
+                        }
+
+                        KeyCode::PageDown => {
+                            move_selection(state, 5);
                         }
 
                         KeyCode::Enter if handle_enter(state)? => {
@@ -250,23 +373,55 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                 }
 
                 Event::Mouse(mouse_event) => match mouse_event.kind {
-                    MouseEventKind::ScrollUp => move_selection(state, -1),
-                    MouseEventKind::ScrollDown => move_selection(state, 1),
+                    MouseEventKind::ScrollUp => {
+                        move_selection(state, -1);
+                        needs_redraw = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        move_selection(state, 1);
+                        needs_redraw = true;
+                    }
                     _ => {}
                 },
 
                 _ => {}
             }
+        } else if state.settings.timers && last_timer_check.elapsed() >= Duration::from_millis(500) {
+            last_timer_check = std::time::Instant::now();
+            let list = state.timers.lock().unwrap();
+            let has_active = list.iter().any(|t| !t.finished);
+            drop(list);
+            if has_active {
+                needs_redraw = true;
+            }
         }
-
-        draw(state, stdout)?;
     }
 
     Ok(())
 }
 
-fn move_selection(state: &mut State, direction: i32) {
+fn move_selection(state: &mut State, delta: i32) {
     if is_timer_mode(&state.query) || is_settings_mode(&state.query) {
+        return;
+    }
+
+    if let ViewMode::Actions { action_selected } = state.view_mode {
+        let matches = matching_apps(state);
+        if let Some(app) = matches.get(state.selected) {
+            let total_actions = 1 + app.actions.len();
+            let new_selected = if total_actions == 0 {
+                0
+            } else if delta < 0 {
+                let abs = delta.unsigned_abs() as usize;
+                action_selected.saturating_sub(abs)
+            } else {
+                let count = delta as usize;
+                (action_selected + count).min(total_actions - 1)
+            };
+            state.view_mode = ViewMode::Actions {
+                action_selected: new_selected,
+            };
+        }
         return;
     }
 
@@ -278,10 +433,12 @@ fn move_selection(state: &mut State, direction: i32) {
             return;
         }
 
-        if direction < 0 {
-            state.history_selected = state.history_selected.saturating_sub(1);
+        if delta < 0 {
+            let abs = delta.unsigned_abs() as usize;
+            state.history_selected = state.history_selected.saturating_sub(abs);
         } else {
-            state.history_selected = (state.history_selected + 1).min(len - 1);
+            let count = delta as usize;
+            state.history_selected = (state.history_selected + count).min(len - 1);
         }
 
         return;
@@ -294,15 +451,45 @@ fn move_selection(state: &mut State, direction: i32) {
         return;
     }
 
-    if direction < 0 {
-        state.selected = state.selected.saturating_sub(1);
+    if delta < 0 {
+        let abs = delta.unsigned_abs() as usize;
+        state.selected = state.selected.saturating_sub(abs);
     } else {
-        state.selected = (state.selected + 1).min(matches.len() - 1);
+        let count = delta as usize;
+        state.selected = (state.selected + count).min(matches.len() - 1);
     }
 }
 
 fn handle_enter(state: &mut State) -> io::Result<bool> {
     state.launch_error = None;
+
+    if let ViewMode::Actions { action_selected } = state.view_mode {
+        let matches = matching_apps(state);
+        if let Some(app) = matches.get(state.selected) {
+            let launch_res = if action_selected == 0 {
+                apps::launch(app)
+            } else if let Some(action) = app.actions.get(action_selected - 1) {
+                apps::launch_action(app, action)
+            } else {
+                apps::launch(app)
+            };
+
+            match launch_res {
+                Ok(()) => {
+                    state.recents = recents::record(&app.name);
+                    return Ok(true);
+                }
+                Err(error) => {
+                    state.launch_error = Some(format!("launch failed: {error}"));
+                    state.view_mode = ViewMode::Apps;
+                    return Ok(false);
+                }
+            }
+        }
+        state.view_mode = ViewMode::Apps;
+        return Ok(false);
+    }
+
     let query = state.query.trim().to_string();
 
     if let Some(command) = timer_command(&query) {
@@ -715,6 +902,10 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn fill_background(stdout: &mut io::Stdout, cols: u16, rows: u16, bg: Color) -> io::Result<()> {
+    if bg == Color::Reset {
+        return Ok(());
+    }
+
     let line = " ".repeat(cols as usize);
 
     queue!(stdout, SetBackgroundColor(bg))?;
@@ -730,6 +921,7 @@ fn fill_background(stdout: &mut io::Stdout, cols: u16, rows: u16, bg: Color) -> 
 
 struct ListRow {
     text: String,
+    badge: Option<String>,
     color: Color,
 }
 
@@ -750,8 +942,14 @@ fn draw_list(
 
     let width = cols as usize;
 
-    let text_width = width.saturating_sub(2);
-    let wrapped: Vec<Vec<String>> = items.iter().map(|it| wrap(&it.text, text_width)).collect();
+    let wrapped: Vec<Vec<String>> = items
+        .iter()
+        .map(|it| {
+            let right_pad = if it.badge.is_some() { 4 } else { 2 };
+            let text_width = width.saturating_sub(2 + right_pad).max(1);
+            wrap(&it.text, text_width)
+        })
+        .collect();
 
     let available = term_rows.saturating_sub(*row).saturating_sub(bottom_lines) as usize;
 
@@ -763,21 +961,32 @@ fn draw_list(
     let sel = selected.unwrap_or(0).min(items.len() - 1);
 
     let (first, last) = if total <= available {
-        (0, items.len() - 1)
+        (0, items.len().saturating_sub(1))
     } else {
-        let usable = available.saturating_sub(1).max(1);
         let mut first = sel;
         let mut last = sel;
         let mut used = wrapped[sel].len();
 
-        while last + 1 < items.len() && used + wrapped[last + 1].len() <= usable {
-            last += 1;
-            used += wrapped[last].len();
+        while last + 1 < items.len() {
+            let next_len = wrapped[last + 1].len();
+            let needed_more = if last + 2 < items.len() { 1 } else { 0 };
+            if used + next_len + needed_more <= available {
+                last += 1;
+                used += next_len;
+            } else {
+                break;
+            }
         }
 
-        while first > 0 && used + wrapped[first - 1].len() <= usable {
-            first -= 1;
-            used += wrapped[first].len();
+        while first > 0 {
+            let prev_len = wrapped[first - 1].len();
+            let needed_more = if last + 1 < items.len() { 1 } else { 0 };
+            if used + prev_len + needed_more <= available {
+                first -= 1;
+                used += prev_len;
+            } else {
+                break;
+            }
         }
 
         (first, last)
@@ -787,29 +996,64 @@ fn draw_list(
     let mut y = *row;
 
     for i in first..=last {
-        for line in &wrapped[i] {
+        let is_sel = selected == Some(i);
+        let row_bg = if is_sel {
+            palette.accent
+        } else {
+            palette.bg
+        };
+        let fg_color = if is_sel {
+            palette.sel_fg
+        } else {
+            items[i].color
+        };
+        let dim_color = if is_sel {
+            palette.sel_fg
+        } else {
+            palette.dim
+        };
+
+        for (line_idx, line) in wrapped[i].iter().enumerate() {
             if budget == 0 {
                 break;
             }
 
             queue!(stdout, cursor::MoveTo(0, y))?;
 
-            if selected == Some(i) {
-                let text = format!("  {}", line);
+            if line_idx == 0 {
                 queue!(
                     stdout,
-                    SetForegroundColor(palette.sel_fg),
-                    SetBackgroundColor(palette.accent),
-                    Print(&text),
-                    Print(" ".repeat(width.saturating_sub(text.width()))),
-                    ResetColor,
-                )?;
-            } else {
-                queue!(
-                    stdout,
-                    SetForegroundColor(items[i].color),
-                    SetBackgroundColor(palette.bg),
+                    SetBackgroundColor(row_bg),
+                    SetForegroundColor(fg_color),
                     Print(format!("  {}", line)),
+                )?;
+
+                let used_width = 2 + line.width();
+                if let Some(ref badge) = items[i].badge {
+                    let badge_w = badge.width();
+                    let pad = width.saturating_sub(used_width + badge_w + 2);
+                    queue!(
+                        stdout,
+                        Print(" ".repeat(pad)),
+                        SetForegroundColor(dim_color),
+                        Print(badge),
+                        Print("  "),
+                        ResetColor,
+                    )?;
+                } else {
+                    let pad = width.saturating_sub(used_width);
+                    queue!(stdout, Print(" ".repeat(pad)), ResetColor)?;
+                }
+            } else {
+                let used_width = 2 + line.width();
+                let pad = width.saturating_sub(used_width);
+                queue!(
+                    stdout,
+                    SetBackgroundColor(row_bg),
+                    SetForegroundColor(fg_color),
+                    Print("  "),
+                    Print(line),
+                    Print(" ".repeat(pad)),
                     ResetColor,
                 )?;
             }
@@ -905,28 +1149,6 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
         s
     };
 
-    let visible_query = take_cells(skip_cells(&state.query, start), visible);
-
-    queue!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        SetForegroundColor(palette.accent),
-        SetBackgroundColor(palette.bg),
-        Print("> "),
-        SetForegroundColor(palette.fg),
-        Print(&visible_query),
-        ResetColor,
-    )?;
-
-    queue!(
-        stdout,
-        cursor::MoveTo(0, 1),
-        SetForegroundColor(palette.dim),
-        SetBackgroundColor(palette.bg),
-        Print("─".repeat(cols as usize)),
-        ResetColor,
-    )?;
-
     let query_trim = state.query.trim().to_string();
 
     let is_timer = is_timer_mode(&query_trim);
@@ -939,7 +1161,55 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
         None
     };
 
-    let (label, segments): (&str, Vec<&str>) = if is_timer {
+    if let ViewMode::Actions { .. } = state.view_mode {
+        let app_name = matches
+            .as_ref()
+            .and_then(|m| m.get(state.selected))
+            .map(|a| a.name.as_str())
+            .unwrap_or("App");
+        let header_text = format!("{} › Launch Options", app_name);
+        let visible_header = fit(&header_text, visible);
+
+        queue!(
+            stdout,
+            cursor::MoveTo(0, 0),
+            SetForegroundColor(palette.accent),
+            SetBackgroundColor(palette.bg),
+            Print("> "),
+            SetForegroundColor(palette.fg),
+            Print(&visible_header),
+            ResetColor,
+        )?;
+    } else {
+        let visible_query = take_cells(skip_cells(&state.query, start), visible);
+
+        queue!(
+            stdout,
+            cursor::MoveTo(0, 0),
+            SetForegroundColor(palette.accent),
+            SetBackgroundColor(palette.bg),
+            Print("> "),
+            SetForegroundColor(palette.fg),
+            Print(&visible_query),
+            ResetColor,
+        )?;
+    }
+
+    queue!(
+        stdout,
+        cursor::MoveTo(0, 1),
+        SetForegroundColor(palette.dim),
+        SetBackgroundColor(palette.bg),
+        Print("─".repeat(cols as usize)),
+        ResetColor,
+    )?;
+
+    let (label, segments): (&str, Vec<&str>) = if let ViewMode::Actions { .. } = state.view_mode {
+        (
+            "actions",
+            vec!["↑↓ select", "enter launch", "←/esc back"],
+        )
+    } else if is_timer {
         (
             "timers",
             vec!["5m coffee", "clear [all|n|done]", "esc quit"],
@@ -960,6 +1230,7 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
             vec![
                 "↑↓ select",
                 "enter open",
+                "→ options",
                 "t: timers",
                 "m: calc",
                 "s: settings",
@@ -1011,7 +1282,22 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
 
     let mut row = 2u16;
 
-    if let Some(command) = timer_command(&query_trim) {
+    if let ViewMode::Actions { action_selected } = state.view_mode {
+        if let Some(m) = &matches
+            && let Some(app) = m.get(state.selected)
+        {
+            draw_actions_mode(
+                app,
+                action_selected,
+                stdout,
+                &mut row,
+                term_rows,
+                cols,
+                bottom_lines,
+                palette,
+            )?;
+        }
+    } else if let Some(command) = timer_command(&query_trim) {
         draw_timer_mode(
             state,
             stdout,
@@ -1095,16 +1381,59 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
         )?;
     }
 
-    let cursor_col = (prompt_width + cursor_chars.saturating_sub(start)) as u16;
-
-    queue!(
-        stdout,
-        cursor::MoveTo(cursor_col.min(cols.saturating_sub(1)), 0),
-    )?;
+    if let ViewMode::Actions { .. } = state.view_mode {
+        queue!(stdout, cursor::Hide)?;
+    } else {
+        let cursor_col = (prompt_width + cursor_chars.saturating_sub(start)) as u16;
+        queue!(
+            stdout,
+            cursor::Show,
+            cursor::MoveTo(cursor_col.min(cols.saturating_sub(1)), 0),
+        )?;
+    }
 
     stdout.flush()?;
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_actions_mode(
+    app: &App,
+    action_selected: usize,
+    stdout: &mut io::Stdout,
+    row: &mut u16,
+    term_rows: u16,
+    cols: u16,
+    bottom_lines: u16,
+    palette: &Palette,
+) -> io::Result<()> {
+    let mut items = Vec::new();
+
+    items.push(ListRow {
+        text: format!("Launch {} (Default)", app.name),
+        badge: None,
+        color: palette.fg,
+    });
+
+    for action in &app.actions {
+        items.push(ListRow {
+            text: action.name.clone(),
+            badge: None,
+            color: palette.fg,
+        });
+    }
+
+    draw_list(
+        stdout,
+        row,
+        term_rows,
+        cols,
+        bottom_lines,
+        palette,
+        &items,
+        Some(action_selected),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,6 +1495,7 @@ fn draw_timer_mode(
 
             ListRow {
                 text: format!("{}. [{}] {}", index + 1, marker, timer.label),
+                badge: None,
                 color,
             }
         })
@@ -1269,6 +1599,7 @@ fn draw_math_mode(
         .enumerate()
         .map(|(index, entry)| ListRow {
             text: format!("{}. {}", index + 1, entry),
+            badge: None,
             color: palette.fg,
         })
         .collect();
@@ -1297,18 +1628,22 @@ fn draw_settings_mode(
     let items = vec![
         ListRow {
             text: format!("1. {:<14} {}", "background", state.settings.background),
+            badge: None,
             color: palette.fg,
         },
         ListRow {
             text: format!("2. {:<14} {}", "footer(hints)", state.settings.footer),
+            badge: None,
             color: palette.fg,
         },
         ListRow {
             text: format!("3. {:<14} {}", "timers", state.settings.timers),
+            badge: None,
             color: palette.fg,
         },
         ListRow {
             text: format!("4. {:<14} {}", "display", state.settings.display.as_str()),
+            badge: None,
             color: palette.fg,
         },
     ];
@@ -1366,6 +1701,11 @@ fn draw_app_results(
         .iter()
         .map(|app| ListRow {
             text: app.name.clone(),
+            badge: if !app.actions.is_empty() {
+                Some("›".to_string())
+            } else {
+                None
+            },
             color: palette.fg,
         })
         .collect();

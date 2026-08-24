@@ -6,15 +6,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
+pub struct AppAction {
+    #[allow(dead_code)]
+    pub id: String,
+    pub name: String,
+    pub exec: Vec<String>,
+    pub icon: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct App {
     pub name: String,
     pub exec: Vec<String>,
-    #[allow(dead_code)]
     pub icon: Option<String>,
-    terminal: bool,
-    path: Option<PathBuf>,
-    dbus_activatable: bool,
-    desktop_file: PathBuf,
+    pub actions: Vec<AppAction>,
+    pub terminal: bool,
+    pub path: Option<PathBuf>,
+    pub dbus_activatable: bool,
+    pub desktop_file: PathBuf,
 }
 
 fn desktop_file_dirs() -> Vec<PathBuf> {
@@ -210,18 +219,19 @@ fn try_exec_available(value: &str) -> bool {
 
 fn parse_desktop_file(path: &Path) -> Option<App> {
     let content = fs::read_to_string(path).ok()?;
-    let mut in_desktop_entry = false;
-    let mut fields: HashMap<String, String> = HashMap::new();
+    let mut current_section = String::new();
+    let mut main_fields: HashMap<String, String> = HashMap::new();
+    let mut action_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     for line in content.lines() {
         let line = line.trim();
 
-        if line.starts_with('[') {
-            in_desktop_entry = line == "[Desktop Entry]";
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = line[1..line.len() - 1].trim().to_string();
             continue;
         }
 
-        if !in_desktop_entry || line.is_empty() || line.starts_with('#') {
+        if current_section.is_empty() || line.is_empty() || line.starts_with('#') {
             continue;
         }
 
@@ -229,31 +239,41 @@ fn parse_desktop_file(path: &Path) -> Option<App> {
             if key.contains('[') {
                 continue;
             }
-            fields.insert(key.trim().to_string(), value.trim().to_string());
+            let k = key.trim().to_string();
+            let v = value.trim().to_string();
+
+            if current_section == "Desktop Entry" {
+                main_fields.insert(k, v);
+            } else if let Some(action_id) = current_section.strip_prefix("Desktop Action ") {
+                action_fields
+                    .entry(action_id.trim().to_string())
+                    .or_default()
+                    .insert(k, v);
+            }
         }
     }
 
-    let entry_type = fields
+    let entry_type = main_fields
         .get("Type")
         .map(String::as_str)
         .unwrap_or("Application");
     if entry_type != "Application"
-        || parse_bool(&fields, "NoDisplay")
-        || parse_bool(&fields, "Hidden")
-        || !desktop_is_visible(&fields)
+        || parse_bool(&main_fields, "NoDisplay")
+        || parse_bool(&main_fields, "Hidden")
+        || !desktop_is_visible(&main_fields)
     {
         return None;
     }
 
-    if let Some(try_exec) = fields.get("TryExec")
+    if let Some(try_exec) = main_fields.get("TryExec")
         && !try_exec_available(try_exec)
     {
         return None;
     }
 
-    let name = fields.get("Name")?.clone();
-    let dbus_activatable = parse_bool(&fields, "DBusActivatable");
-    let exec = fields
+    let name = main_fields.get("Name")?.clone();
+    let dbus_activatable = parse_bool(&main_fields, "DBusActivatable");
+    let exec = main_fields
         .get("Exec")
         .and_then(|raw| parse_exec(raw))
         .unwrap_or_default();
@@ -262,16 +282,57 @@ fn parse_desktop_file(path: &Path) -> Option<App> {
         return None;
     }
 
-    let working_dir = fields
+    let working_dir = main_fields
         .get("Path")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
 
+    let icon = main_fields.get("Icon").cloned();
+
+    let mut actions = Vec::new();
+    let action_ids: Vec<String> = if let Some(actions_str) = main_fields.get("Actions") {
+        actions_str
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        action_fields.keys().cloned().collect()
+    };
+
+    for id in action_ids {
+        if let Some(fields) = action_fields.get(&id) {
+            let action_name = fields
+                .get("Name")
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            let action_exec = fields
+                .get("Exec")
+                .and_then(|raw| parse_exec(raw))
+                .unwrap_or_default();
+
+            if action_exec.is_empty() {
+                continue;
+            }
+
+            let action_icon = fields.get("Icon").cloned().or_else(|| icon.clone());
+
+            actions.push(AppAction {
+                id,
+                name: action_name,
+                exec: action_exec,
+                icon: action_icon,
+            });
+        }
+    }
+
     Some(App {
         name,
         exec,
-        icon: fields.get("Icon").cloned(),
-        terminal: parse_bool(&fields, "Terminal"),
+        icon,
+        actions,
+        terminal: parse_bool(&main_fields, "Terminal"),
         path: working_dir,
         dbus_activatable,
         desktop_file: path.to_path_buf(),
@@ -361,6 +422,28 @@ fn expand_exec(app: &App) -> Vec<String> {
     expanded
 }
 
+fn expand_action_exec(app: &App, action: &AppAction) -> Vec<String> {
+    let mut expanded = Vec::new();
+    let icon_to_use = action.icon.as_deref().or(app.icon.as_deref());
+
+    for arg in &action.exec {
+        match arg.as_str() {
+            "%f" | "%F" | "%u" | "%U" => {}
+            "%i" => {
+                if let Some(icon) = icon_to_use {
+                    expanded.push("--icon".to_string());
+                    expanded.push(icon.to_string());
+                }
+            }
+            "%c" => expanded.push(action.name.clone()),
+            "%k" => expanded.push(app.desktop_file.to_string_lossy().into_owned()),
+            _ => expanded.push(arg.replace("%%", "%")),
+        }
+    }
+
+    expanded
+}
+
 fn terminal_program() -> Option<Vec<String>> {
     if let Ok(value) = env::var("TERMINAL")
         && let Some(parts) = parse_exec(&value)
@@ -372,13 +455,15 @@ fn terminal_program() -> Option<Vec<String>> {
     }
 
     [
-        "x-terminal-emulator",
-        "gnome-terminal",
-        "konsole",
-        "xfce4-terminal",
-        "alacritty",
-        "kitty",
         "foot",
+        "ghostty",
+        "wezterm",
+        "kitty",
+        "alacritty",
+        "xfce4-terminal",
+        "konsole",
+        "gnome-terminal",
+        "x-terminal-emulator",
         "xterm",
     ]
     .iter()
@@ -468,6 +553,27 @@ pub fn launch(app: &App) -> io::Result<()> {
     spawn_detached(process)
 }
 
+pub fn launch_action(app: &App, action: &AppAction) -> io::Result<()> {
+    let exec = expand_action_exec(app, action);
+    let Some((command, args)) = exec.split_first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop action has no executable command",
+        ));
+    };
+
+    if app.terminal {
+        return spawn_detached(launch_terminal(&exec, app.path.as_deref())?);
+    }
+
+    let mut process = Command::new(command);
+    process.args(args);
+    if let Some(path) = &app.path {
+        process.current_dir(path);
+    }
+    spawn_detached(process)
+}
+
 #[cfg(unix)]
 fn libc_setsid() -> i32 {
     unsafe extern "C" {
@@ -478,7 +584,7 @@ fn libc_setsid() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_desktop_file, parse_exec, valid_field_codes};
+    use super::{parse_desktop_file, parse_exec, scan_apps, valid_field_codes};
     use std::fs;
     use std::path::PathBuf;
 
@@ -521,5 +627,36 @@ mod tests {
         assert!(app.terminal);
         assert_eq!(app.path, Some(PathBuf::from("/tmp")));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_desktop_actions() {
+        let path = PathBuf::from(format!(
+            "/tmp/mylauncher-actions-test-{}.desktop",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Browser\nExec=browser %u\nActions=new-window;private;\n\n[Desktop Action new-window]\nName=New Window\nExec=browser --new-window\n\n[Desktop Action private]\nName=Private Window\nExec=browser --incognito\n",
+        )
+        .unwrap();
+
+        let app = parse_desktop_file(&path).unwrap();
+        assert_eq!(app.actions.len(), 2);
+        assert_eq!(app.actions[0].id, "new-window");
+        assert_eq!(app.actions[0].name, "New Window");
+        assert_eq!(app.actions[0].exec, vec!["browser", "--new-window"]);
+        assert_eq!(app.actions[1].id, "private");
+        assert_eq!(app.actions[1].name, "Private Window");
+        assert_eq!(app.actions[1].exec, vec!["browser", "--incognito"]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn scans_real_apps_speed() {
+        let start = std::time::Instant::now();
+        let apps = scan_apps();
+        let elapsed = start.elapsed();
+        println!("scanned {} apps in {:?}", apps.len(), elapsed);
     }
 }
