@@ -1,10 +1,13 @@
 mod apps;
+mod convert;
 mod history;
+mod power;
 mod pratt;
 mod recents;
 mod settings;
 mod storage;
 mod timers;
+mod web;
 
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -16,6 +19,7 @@ use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use apps::App;
+use power::PowerOption;
 use settings::{DisplayMode, Settings};
 use timers::SharedTimers;
 
@@ -82,6 +86,7 @@ struct State {
     all_apps: Vec<App>,
     selected: usize,
     history_selected: usize,
+    power_selected: usize,
     timers: SharedTimers,
     math_history: Vec<String>,
     settings: Settings,
@@ -106,6 +111,7 @@ fn main() -> io::Result<()> {
         all_apps,
         selected: 0,
         history_selected: 0,
+        power_selected: 0,
         timers,
         math_history,
         settings,
@@ -196,6 +202,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                             state.cursor = 0;
                             state.selected = 0;
                             state.history_selected = 0;
+                            state.power_selected = 0;
                             state.launch_error = None;
                             state.view_mode = ViewMode::Apps;
                         }
@@ -216,6 +223,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                             }
                             state.selected = 0;
                             state.history_selected = 0;
+                            state.power_selected = 0;
                             state.launch_error = None;
                             state.view_mode = ViewMode::Apps;
                         }
@@ -229,17 +237,19 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                         }
 
                         KeyCode::Right => {
+                            let query_trim = state.query.trim();
                             if state.view_mode == ViewMode::Apps
-                                && !is_timer_mode(&state.query)
-                                && !is_math_mode(&state.query)
-                                && !is_settings_mode(&state.query)
+                                && !is_timer_mode(query_trim)
+                                && !is_math_mode(query_trim)
+                                && !is_settings_mode(query_trim)
+                                && !is_web_mode(query_trim)
+                                && !is_convert_mode(query_trim)
+                                && !is_power_mode(query_trim)
                             {
                                 let matches = matching_apps(state);
                                 if let Some(app) = matches.get(state.selected) {
                                     if !app.actions.is_empty() {
-                                        state.view_mode = ViewMode::Actions {
-                                            action_selected: 0,
-                                        };
+                                        state.view_mode = ViewMode::Actions { action_selected: 0 };
                                     } else {
                                         state.cursor = cursor_right(&state.query, state.cursor);
                                     }
@@ -250,17 +260,19 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                         }
 
                         KeyCode::Tab => {
+                            let query_trim = state.query.trim();
                             if state.view_mode == ViewMode::Apps
-                                && !is_timer_mode(&state.query)
-                                && !is_math_mode(&state.query)
-                                && !is_settings_mode(&state.query)
+                                && !is_timer_mode(query_trim)
+                                && !is_math_mode(query_trim)
+                                && !is_settings_mode(query_trim)
+                                && !is_web_mode(query_trim)
+                                && !is_convert_mode(query_trim)
+                                && !is_power_mode(query_trim)
                             {
                                 let matches = matching_apps(state);
                                 if let Some(app) = matches.get(state.selected) {
                                     if !app.actions.is_empty() {
-                                        state.view_mode = ViewMode::Actions {
-                                            action_selected: 0,
-                                        };
+                                        state.view_mode = ViewMode::Actions { action_selected: 0 };
                                     }
                                 }
                             }
@@ -277,9 +289,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                                 let matches = matching_apps(state);
                                 if let Some(app) = matches.get(state.selected) {
                                     if !app.actions.is_empty() {
-                                        state.view_mode = ViewMode::Actions {
-                                            action_selected: 0,
-                                        };
+                                        state.view_mode = ViewMode::Actions { action_selected: 0 };
                                     }
                                 }
                             }
@@ -321,6 +331,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                             state.cursor += c.len_utf8();
                             state.selected = 0;
                             state.history_selected = 0;
+                            state.power_selected = 0;
                             state.launch_error = None;
                         }
 
@@ -333,6 +344,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                                 state.cursor = prev;
                                 state.selected = 0;
                                 state.history_selected = 0;
+                                state.power_selected = 0;
                                 state.launch_error = None;
                             }
                         }
@@ -344,6 +356,7 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                                 state.query.remove(state.cursor);
                                 state.selected = 0;
                                 state.history_selected = 0;
+                                state.power_selected = 0;
                                 state.launch_error = None;
                             }
                         }
@@ -386,12 +399,13 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
 
                 _ => {}
             }
-        } else if state.settings.timers && last_timer_check.elapsed() >= Duration::from_millis(500) {
+        } else if state.settings.timers && last_timer_check.elapsed() >= Duration::from_millis(500)
+        {
             last_timer_check = std::time::Instant::now();
             let list = state.timers.lock().unwrap();
-            let has_active = list.iter().any(|t| !t.finished);
+            let has_timers = !list.is_empty();
             drop(list);
-            if has_active {
+            if has_timers {
                 needs_redraw = true;
             }
         }
@@ -401,7 +415,23 @@ fn event_loop(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
 }
 
 fn move_selection(state: &mut State, delta: i32) {
-    if is_timer_mode(&state.query) || is_settings_mode(&state.query) {
+    if is_timer_mode(&state.query) || is_settings_mode(&state.query) || is_web_mode(&state.query) {
+        return;
+    }
+
+    if let Some(cmd) = power_command(&state.query) {
+        let options = matching_power_options(cmd);
+        if options.is_empty() {
+            state.power_selected = 0;
+            return;
+        }
+        if delta < 0 {
+            let abs = delta.unsigned_abs() as usize;
+            state.power_selected = state.power_selected.saturating_sub(abs);
+        } else {
+            let count = delta as usize;
+            state.power_selected = (state.power_selected + count).min(options.len() - 1);
+        }
         return;
     }
 
@@ -492,6 +522,37 @@ fn handle_enter(state: &mut State) -> io::Result<bool> {
 
     let query = state.query.trim().to_string();
 
+    if let Some(search) = web_command(&query) {
+        if !search.is_empty() {
+            match web::open_web(search) {
+                Ok(()) => return Ok(true),
+                Err(e) => state.launch_error = Some(format!("web search failed: {e}")),
+            }
+        }
+        return Ok(false);
+    }
+
+    if let Some(cmd) = convert_command(&query) {
+        if let Some(result) = convert::convert_input(cmd) {
+            let _ = history::append(&result);
+            state.math_history.push(result);
+            state.query = "c: ".to_string();
+            state.cursor = state.query.len();
+        }
+        return Ok(false);
+    }
+
+    if let Some(cmd) = power_command(&query) {
+        let options = matching_power_options(cmd);
+        if let Some(opt) = options.get(state.power_selected) {
+            match power::execute_power(opt) {
+                Ok(()) => return Ok(true),
+                Err(e) => state.launch_error = Some(format!("power action failed: {e}")),
+            }
+        }
+        return Ok(false);
+    }
+
     if let Some(command) = timer_command(&query) {
         if command.is_empty() {
             return Ok(false);
@@ -522,6 +583,7 @@ fn handle_enter(state: &mut State) -> io::Result<bool> {
                         label,
                         end_unix,
                         finished: false,
+                        notified: false,
                     },
                 ) {
                     state.launch_error = Some(format!("timer failed: {error}"));
@@ -663,46 +725,64 @@ fn handle_enter(state: &mut State) -> io::Result<bool> {
     Ok(false)
 }
 
+fn web_command(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    if trimmed == "w:" {
+        return Some("");
+    }
+    trimmed.strip_prefix("w:").map(str::trim)
+}
+
+fn convert_command(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    if trimmed == "c:" {
+        return Some("");
+    }
+    trimmed.strip_prefix("c:").map(str::trim)
+}
+
+fn power_command(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    if trimmed == "p:" {
+        return Some("");
+    }
+    trimmed.strip_prefix("p:").map(str::trim)
+}
+
 fn timer_command(input: &str) -> Option<&str> {
     let trimmed = input.trim();
-
     if trimmed == "t:" {
         return Some("");
     }
-
-    if let Some(rest) = trimmed.strip_prefix("t:") {
-        return Some(rest.trim());
-    }
-
-    None
+    trimmed.strip_prefix("t:").map(str::trim)
 }
 
 fn math_command(input: &str) -> Option<&str> {
     let trimmed = input.trim();
-
     if trimmed == "m:" {
         return Some("");
     }
-
-    if let Some(rest) = trimmed.strip_prefix("m:") {
-        return Some(rest.trim());
-    }
-
-    None
+    trimmed.strip_prefix("m:").map(str::trim)
 }
 
 fn settings_command(input: &str) -> Option<&str> {
     let trimmed = input.trim();
-
     if trimmed == "s:" {
         return Some("");
     }
+    trimmed.strip_prefix("s:").map(str::trim)
+}
 
-    if let Some(rest) = trimmed.strip_prefix("s:") {
-        return Some(rest.trim());
-    }
+fn is_web_mode(input: &str) -> bool {
+    web_command(input).is_some()
+}
 
-    None
+fn is_convert_mode(input: &str) -> bool {
+    convert_command(input).is_some()
+}
+
+fn is_power_mode(input: &str) -> bool {
+    power_command(input).is_some()
 }
 
 fn is_timer_mode(input: &str) -> bool {
@@ -725,7 +805,6 @@ fn strip_prefix_word<'a>(input: &'a str, words: &[&str]) -> Option<&'a str> {
             return Some(rest.trim_start());
         }
     }
-
     None
 }
 
@@ -733,17 +812,14 @@ fn match_score(name_lower: &str, query: &str) -> Option<usize> {
     if query.is_empty() {
         return Some(0);
     }
-
     if name_lower.starts_with(query) {
         return Some(0);
     }
-
     if name_lower.contains(query) {
         return Some(1);
     }
 
     let mut chars = name_lower.chars();
-
     for want in query.chars() {
         loop {
             match chars.next() {
@@ -753,8 +829,25 @@ fn match_score(name_lower: &str, query: &str) -> Option<usize> {
             }
         }
     }
-
     Some(2)
+}
+
+fn matching_power_options(query: &str) -> Vec<PowerOption> {
+    let all = power::all_power_options();
+    let query_lower = query.trim().to_lowercase();
+    if query_lower.is_empty() {
+        return all;
+    }
+
+    let mut scored: Vec<(usize, PowerOption)> = all
+        .into_iter()
+        .filter_map(|opt| {
+            let score = match_score(&opt.name.to_lowercase(), &query_lower)?;
+            Some((score, opt))
+        })
+        .collect();
+    scored.sort_by_key(|(s, _)| *s);
+    scored.into_iter().map(|(_, opt)| opt).collect()
 }
 
 fn matching_apps(state: &State) -> Vec<App> {
@@ -945,8 +1038,8 @@ fn draw_list(
     let wrapped: Vec<Vec<String>> = items
         .iter()
         .map(|it| {
-            let right_pad = if it.badge.is_some() { 4 } else { 2 };
-            let text_width = width.saturating_sub(2 + right_pad).max(1);
+            let badge_w = it.badge.as_ref().map_or(0, |b| b.width() + 2);
+            let text_width = width.saturating_sub(2 + badge_w + 2).max(1);
             wrap(&it.text, text_width)
         })
         .collect();
@@ -997,21 +1090,13 @@ fn draw_list(
 
     for i in first..=last {
         let is_sel = selected == Some(i);
-        let row_bg = if is_sel {
-            palette.accent
-        } else {
-            palette.bg
-        };
+        let row_bg = if is_sel { palette.accent } else { palette.bg };
         let fg_color = if is_sel {
             palette.sel_fg
         } else {
             items[i].color
         };
-        let dim_color = if is_sel {
-            palette.sel_fg
-        } else {
-            palette.dim
-        };
+        let dim_color = if is_sel { palette.sel_fg } else { palette.dim };
 
         for (line_idx, line) in wrapped[i].iter().enumerate() {
             if budget == 0 {
@@ -1141,21 +1226,23 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
         0
     } else {
         let mut s = cursor_chars.saturating_sub(visible.saturating_sub(1));
-
         if s + visible > query_len {
             s = query_len - visible;
         }
-
         s
     };
 
     let query_trim = state.query.trim().to_string();
 
+    let is_web = is_web_mode(&query_trim);
+    let is_convert = is_convert_mode(&query_trim);
+    let is_power = is_power_mode(&query_trim);
     let is_timer = is_timer_mode(&query_trim);
     let is_math = is_math_mode(&query_trim);
     let is_settings = is_settings_mode(&query_trim);
 
-    let matches = if !is_timer && !is_math && !is_settings {
+    let is_special = is_web || is_convert || is_power || is_timer || is_math || is_settings;
+    let matches = if !is_special {
         Some(matching_apps(state))
     } else {
         None
@@ -1205,10 +1292,25 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
     )?;
 
     let (label, segments): (&str, Vec<&str>) = if let ViewMode::Actions { .. } = state.view_mode {
+        ("actions", vec!["↑↓ select", "enter launch", "←/esc back"])
+    } else if is_web {
         (
-            "actions",
-            vec!["↑↓ select", "enter launch", "←/esc back"],
+            "web",
+            vec![
+                "enter search / open url",
+                "!bangs supported",
+                "!gh - github",
+                "!yt - youtube",
+                "esc quit",
+            ],
         )
+    } else if is_convert {
+        (
+            "convert",
+            vec!["e.g. 100km to mi", "50f to c", "1gb to mb", "esc quit"],
+        )
+    } else if is_power {
+        ("power", vec!["↑↓ select", "enter execute", "esc quit"])
     } else if is_timer {
         (
             "timers",
@@ -1231,10 +1333,12 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                 "↑↓ select",
                 "enter open",
                 "→ options",
+                "w: web",
+                "c: convert",
+                "p: power",
                 "t: timers",
                 "m: calc",
-                "s: settings",
-                "esc quit",
+                "s: set",
             ],
         )
     };
@@ -1259,17 +1363,22 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
 
     let timer_wrapped = if state.settings.timers {
         let list = state.timers.lock().unwrap();
-        let active: Vec<String> = list
+        let all_timers: Vec<String> = list
             .iter()
-            .filter(|t| !t.finished)
-            .map(|t| format!("{} {}", timers::format_remaining(t.remaining()), t.label))
+            .map(|t| {
+                if t.finished {
+                    format!("[DONE] {}", t.label)
+                } else {
+                    format!("{} {}", timers::format_remaining(t.remaining()), t.label)
+                }
+            })
             .collect();
         drop(list);
 
-        if active.is_empty() {
+        if all_timers.is_empty() {
             None
         } else {
-            Some(wrap(&active.join(" · "), timers_body_width))
+            Some(wrap(&all_timers.join(" · "), timers_body_width))
         }
     } else {
         None
@@ -1297,6 +1406,21 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
                 palette,
             )?;
         }
+    } else if let Some(search) = web_command(&query_trim) {
+        draw_web_mode(stdout, search, &mut row, cols, palette)?;
+    } else if let Some(cmd) = convert_command(&query_trim) {
+        draw_convert_mode(stdout, cmd, &mut row, cols, palette)?;
+    } else if let Some(cmd) = power_command(&query_trim) {
+        draw_power_mode(
+            state,
+            stdout,
+            cmd,
+            &mut row,
+            term_rows,
+            cols,
+            bottom_lines,
+            palette,
+        )?;
     } else if let Some(command) = timer_command(&query_trim) {
         draw_timer_mode(
             state,
@@ -1395,6 +1519,127 @@ fn draw(state: &mut State, stdout: &mut io::Stdout) -> io::Result<()> {
     stdout.flush()?;
 
     Ok(())
+}
+
+fn draw_web_mode(
+    stdout: &mut io::Stdout,
+    search: &str,
+    row: &mut u16,
+    cols: u16,
+    palette: &Palette,
+) -> io::Result<()> {
+    let url_display = if search.is_empty() {
+        "duckduckgo search".to_string()
+    } else {
+        format!("Search: {}", web::search_url(search))
+    };
+
+    let text_width = (cols as usize).saturating_sub(4).max(1);
+    let lines = wrap(&url_display, text_width);
+
+    for line in lines {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, *row),
+            SetForegroundColor(palette.accent),
+            SetBackgroundColor(palette.bg),
+            Print(format!("  {}", line)),
+            ResetColor,
+        )?;
+        *row += 1;
+    }
+
+    *row += 1;
+    Ok(())
+}
+
+fn draw_convert_mode(
+    stdout: &mut io::Stdout,
+    cmd: &str,
+    row: &mut u16,
+    cols: u16,
+    palette: &Palette,
+) -> io::Result<()> {
+    let result_display = if cmd.is_empty() {
+        "type conversion (e.g. 100 km to mi, 50 f to c, 2 gb to mb)".to_string()
+    } else if let Some(res) = convert::convert_input(cmd) {
+        format!("= {}", res)
+    } else {
+        "… (syntax: <value> <unit> to <unit>)".to_string()
+    };
+
+    let text_width = (cols as usize).saturating_sub(4).max(1);
+    let lines = wrap(&result_display, text_width);
+
+    for line in lines {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, *row),
+            SetForegroundColor(palette.accent),
+            SetBackgroundColor(palette.bg),
+            Print(format!("  {}", line)),
+            ResetColor,
+        )?;
+        *row += 1;
+    }
+
+    *row += 1;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_power_mode(
+    state: &mut State,
+    stdout: &mut io::Stdout,
+    cmd: &str,
+    row: &mut u16,
+    term_rows: u16,
+    cols: u16,
+    bottom_lines: u16,
+    palette: &Palette,
+) -> io::Result<()> {
+    let options = matching_power_options(cmd);
+
+    if options.is_empty() {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, *row),
+            SetForegroundColor(palette.dim),
+            SetBackgroundColor(palette.bg),
+            Print("  no matching power options"),
+            ResetColor,
+        )?;
+        *row += 1;
+        return Ok(());
+    }
+
+    if state.power_selected >= options.len() {
+        state.power_selected = options.len() - 1;
+    }
+
+    let items: Vec<ListRow> = options
+        .iter()
+        .map(|opt| ListRow {
+            text: opt.name.clone(),
+            badge: None,
+            color: if opt.name.contains("Off") || opt.name.contains("Reboot") {
+                palette.danger
+            } else {
+                palette.fg
+            },
+        })
+        .collect();
+
+    draw_list(
+        stdout,
+        row,
+        term_rows,
+        cols,
+        bottom_lines,
+        palette,
+        &items,
+        Some(state.power_selected),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

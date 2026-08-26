@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,6 +11,7 @@ pub struct Timer {
     pub label: String,
     pub end_unix: u64,
     pub finished: bool,
+    pub notified: bool,
 }
 
 impl Timer {
@@ -53,19 +55,24 @@ fn parse_file(path: &Path) -> Vec<Timer> {
 
     if let Ok(contents) = fs::read_to_string(path) {
         for line in contents.lines() {
-            let Some((end_str, label)) = line.split_once('\t') else {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let Ok(end_unix) = parts[0].parse::<u64>() else {
                 continue;
             };
 
-            let Ok(end_unix) = end_str.parse::<u64>() else {
-                continue;
-            };
-
+            let label = parts[1].to_string();
+            let notified = parts.get(2).is_some_and(|s| *s == "1" || *s == "true");
             let finished = now_unix() >= end_unix;
+
             timers.push(Timer {
-                label: label.to_string(),
+                label,
                 end_unix,
                 finished,
+                notified,
             });
         }
     }
@@ -140,7 +147,13 @@ fn write_file(list: &[Timer]) -> io::Result<()> {
                     "timer labels must be single-line",
                 ));
             }
-            writeln!(file, "{}\t{}", timer.end_unix, timer.label)?;
+            writeln!(
+                file,
+                "{}\t{}\t{}",
+                timer.end_unix,
+                timer.label,
+                if timer.notified { 1 } else { 0 }
+            )?;
         }
         file.sync_all()?;
         fs::rename(&temporary, path)
@@ -210,9 +223,15 @@ pub fn spawn_ticker(timers: SharedTimers) {
                 let mut changed = false;
 
                 for timer in &mut list {
-                    if !timer.finished && timer.remaining() == Duration::ZERO {
+                    if timer.remaining() == Duration::ZERO {
                         timer.finished = true;
-                        changed = true;
+                        if !timer.notified {
+                            timer.notified = true;
+                            changed = true;
+                            let _ = Command::new("notify-send")
+                                .args(["-a", "Timer", "Timer Finished!", &timer.label])
+                                .spawn();
+                        }
                     }
                 }
 

@@ -303,10 +303,7 @@ fn parse_desktop_file(path: &Path) -> Option<App> {
 
     for id in action_ids {
         if let Some(fields) = action_fields.get(&id) {
-            let action_name = fields
-                .get("Name")
-                .cloned()
-                .unwrap_or_else(|| id.clone());
+            let action_name = fields.get("Name").cloned().unwrap_or_else(|| id.clone());
             let action_exec = fields
                 .get("Exec")
                 .and_then(|raw| parse_exec(raw))
